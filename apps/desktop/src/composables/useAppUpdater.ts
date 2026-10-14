@@ -10,6 +10,9 @@ import { shouldBlockAppUpdate } from "@/lib/app/appUpdateTaskGuard";
 import { uuid } from "@/lib/common/utils";
 import { isUpdatePreviewMockEnabled, previewAppUpdateInfo } from "@/lib/updates/updatePreviewMock";
 
+// Personal portable builds must not replace themselves with an upstream release.
+const appUpdaterDisabled = import.meta.env.VITE_DBX_DISABLE_APP_UPDATER === "true";
+
 interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
   prepareForUpdate?: () => Promise<() => void>;
@@ -223,6 +226,13 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     return t("updates.installFailed", { error: message });
   }
   async function checkUpdates(checkOptions: { silent?: boolean } = {}) {
+    if (appUpdaterDisabled) {
+      if (!checkOptions.silent) {
+        updateCheckMessage.value = "Updates are disabled for this Shanghai trial build.";
+        showUpdateDialog.value = true;
+      }
+      return;
+    }
     if (disposed || isIgnoringUpdate.value) return;
     if (!checkOptions.silent) showUpdateDialog.value = true;
     // A downloaded-but-uninstalled update keeps the app in the ready phase; checks
@@ -281,6 +291,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function downloadUpdateInBackground(automatic = false) {
+    if (appUpdaterDisabled) return;
     if (disposed || isIgnoringUpdate.value || phase.value !== "idle" || downloaded.value || !canDownloadAndInstallUpdate(updateInfo.value, isTauriRuntime())) return;
     if (automatic && !autoUpdateEnabled.value) return;
     automaticDownload = automatic;
@@ -385,6 +396,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function performInstall(restartOnly: boolean) {
+    if (appUpdaterDisabled) return;
     if (!isTauriRuntime() || isInstallingUpdate.value || isIgnoringUpdate.value || (!restartOnly && !downloaded.value)) return;
     const cache = downloaded.value;
     let release: (() => void) | undefined;
@@ -440,6 +452,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     if (updateReady.value) await performInstall(true);
   }
   async function initialize() {
+    if (appUpdaterDisabled) return;
     if (initialized || disposed) return;
     initialized = true;
     if (isTauriRuntime()) {
