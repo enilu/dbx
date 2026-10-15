@@ -203,7 +203,7 @@ import { createLocateTabMenuItem } from "@/lib/tabs/tabMenu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 type ObjectFilter = ObjectBrowserFilter;
-type ObjectBrowserColumnKey = "select" | "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
+type ObjectBrowserColumnKey = "select" | "name" | "type" | "estimatedRows" | "totalBytes" | "dataLength" | "engine" | "autoIncrement" | "created_at" | "updated_at" | "comment";
 
 const props = defineProps<{
   connection: ConnectionConfig;
@@ -217,6 +217,8 @@ const props = defineProps<{
   initialEventCreateRequestId?: number;
   initialObjectFilter?: "tables" | "events";
   selectedObjectFilter?: ObjectFilter;
+  navigator?: boolean;
+  selectedObjectName?: string;
   initialSearchQuery?: string;
   viewport?: ObjectBrowserViewport;
 }>();
@@ -356,6 +358,7 @@ const supportsBatchTableActions = computed(() => !isVictoriaMetrics.value && !is
 const showTableStatistics = computed(() => !usesServerObjectPaging.value && effectiveDatabaseType.value !== "nebula" && (objectFilter.value === "all" || objectFilter.value === "tables"));
 const showObjectRowStats = computed(() => showTableStatistics.value);
 const showObjectSizeStats = computed(() => supportsObjectSizeStats.value && showTableStatistics.value);
+const showMysqlTableDetails = computed(() => props.navigator && effectiveDatabaseType.value === "mysql" && objectFilter.value === "tables");
 const objectRowsLabel = computed(() => t(isVictoriaMetrics.value ? "objects.series" : "objects.rows"));
 
 function toggleTableDdlWordWrap() {
@@ -449,6 +452,9 @@ const objectColumnWidths = ref<Record<ObjectBrowserColumnKey, number>>({
   type: 110,
   estimatedRows: 110,
   totalBytes: 100,
+  dataLength: 110,
+  engine: 100,
+  autoIncrement: 110,
   created_at: 150,
   updated_at: 150,
   comment: 260,
@@ -460,6 +466,13 @@ const objectColumnDefinitions = computed(() => [
   { key: "type" as const, label: t("objects.type") },
   ...(showObjectRowStats.value ? [{ key: "estimatedRows" as const, label: objectRowsLabel.value }] : []),
   ...(showObjectSizeStats.value ? [{ key: "totalBytes" as const, label: t("objects.size") }] : []),
+  ...(showMysqlTableDetails.value
+    ? [
+        { key: "dataLength" as const, label: t("grid.tableInfoDataLength") },
+        { key: "engine" as const, label: t("grid.tableInfoEngine") },
+        { key: "autoIncrement" as const, label: t("grid.tableInfoAutoIncrement") },
+      ]
+    : []),
   ...(hasCreatedAt.value ? [{ key: "created_at" as const, label: t("objects.createdAt") }] : []),
   ...(hasUpdatedAt.value ? [{ key: "updated_at" as const, label: t("objects.updatedAt") }] : []),
   { key: "comment" as const, label: t("objects.comment") },
@@ -526,7 +539,7 @@ const objectFilters = computed<ObjectFilter[]>(() =>
           ["types", objectCounts.value.types],
         ] as Array<[ObjectFilter, number]>
       )
-        .filter(([filter, count]) => filter === "all" || count > 0)
+        .filter(([filter, count]) => filter === "all" || count > 0 || (props.navigator && filter === props.selectedObjectFilter))
         .map(([filter]) => filter),
 );
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
@@ -3939,6 +3952,13 @@ function openInitialEventIfNeeded() {
 
 function finishObjectBrowserRowsLoad() {
   loadingObjects.value = false;
+  if (props.navigator) {
+    objectFilter.value = props.selectedObjectFilter ?? "all";
+    const selected = props.selectedObjectName ? rows.value.find((row) => row.name === props.selectedObjectName) : undefined;
+    if (selected?.type === "TABLE") void openTableInfo(selected, "info");
+    restoreObjectBrowserViewport();
+    return;
+  }
   const preferredFilter = props.initialEventName || props.initialEventCreateRequestId !== undefined ? "events" : (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables");
   if (!usesServerObjectPaging.value && !userHasSelectedFilter.value && objectCounts.value[preferredFilter] > 0) {
     // The default table filter is a presentation choice, not a user query
@@ -4140,12 +4160,17 @@ function mergeObjectStatistics(stats: ObjectStatistics[], fallbackSchema: string
   const statsByKey = new Map(stats.map((stat) => [objectStatisticKey(stat.schema || fallbackSchema, stat.name), stat]));
   rows.value = rows.value.map((row) => {
     if (row.type !== "TABLE") return row;
-    const stat = statsByKey.get(objectStatisticKey(row.schema || fallbackSchema, row.name));
+    const stat = statsByKey.get(objectStatisticKey(row.schema || fallbackSchema, row.name)) ?? (effectiveDatabaseType.value === "mysql" ? statsByKey.get(objectStatisticKey(props.database, row.name)) : undefined);
     if (!stat) return row;
     return {
       ...row,
       estimatedRows: normalizeStatisticNumber(stat.estimated_rows),
       totalBytes: normalizeStatisticNumber(stat.total_bytes),
+      dataLength: normalizeStatisticNumber(stat.data_length),
+      engine: stat.engine,
+      autoIncrement: stat.auto_increment,
+      created_at: stat.created_at ?? row.created_at,
+      updated_at: stat.updated_at ?? row.updated_at,
     };
   });
   cacheObjectBrowserRows(cacheWriteToken, rows.value, { cachedAt });
@@ -4892,6 +4917,18 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                   <GripVertical class="h-3 w-3" />
                 </div>
               </div>
+              <div v-if="showMysqlTableDetails && isObjectColumnVisible('dataLength')" class="relative flex min-w-0 items-center">
+                <span class="truncate">{{ t("grid.tableInfoDataLength") }}</span>
+                <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize" @mousedown="onObjectColumnResizeStart('dataLength', $event)" @dblclick="resetObjectColumnWidth('dataLength', 110, $event)" />
+              </div>
+              <div v-if="showMysqlTableDetails && isObjectColumnVisible('engine')" class="relative flex min-w-0 items-center">
+                <span class="truncate">{{ t("grid.tableInfoEngine") }}</span>
+                <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize" @mousedown="onObjectColumnResizeStart('engine', $event)" @dblclick="resetObjectColumnWidth('engine', 100, $event)" />
+              </div>
+              <div v-if="showMysqlTableDetails && isObjectColumnVisible('autoIncrement')" class="relative flex min-w-0 items-center">
+                <span class="truncate">{{ t("grid.tableInfoAutoIncrement") }}</span>
+                <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize" @mousedown="onObjectColumnResizeStart('autoIncrement', $event)" @dblclick="resetObjectColumnWidth('autoIncrement', 110, $event)" />
+              </div>
               <div v-if="hasCreatedAt && isObjectColumnVisible('created_at')" class="relative flex min-w-0 items-center">
                 <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" :disabled="usesServerObjectPaging" @click="toggleSort('created_at')">
                   <span class="truncate">{{ t("objects.createdAt") }}</span>
@@ -5004,6 +5041,11 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                   <div v-if="showObjectSizeStats && isObjectColumnVisible('totalBytes')" class="truncate text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserBytes(item.totalBytes)">
                     {{ formatObjectBrowserBytes(item.totalBytes) }}
                   </div>
+                  <div v-if="showMysqlTableDetails && isObjectColumnVisible('dataLength')" class="truncate text-xs tabular-nums text-muted-foreground" :title="item.dataLength == null ? '' : formatObjectBrowserBytes(item.dataLength)">
+                    {{ formatObjectBrowserBytes(item.dataLength) }}
+                  </div>
+                  <div v-if="showMysqlTableDetails && isObjectColumnVisible('engine')" class="truncate text-xs text-muted-foreground" :title="item.engine || ''">{{ item.engine || "—" }}</div>
+                  <div v-if="showMysqlTableDetails && isObjectColumnVisible('autoIncrement')" class="truncate text-xs tabular-nums text-muted-foreground" :title="item.autoIncrement || ''">{{ item.autoIncrement || "—" }}</div>
                   <div v-if="hasCreatedAt && isObjectColumnVisible('created_at')" class="truncate text-xs tabular-nums text-muted-foreground" :title="formatObjectBrowserTimestamp(item.created_at)">
                     {{ formatObjectBrowserTimestamp(item.created_at) }}
                   </div>

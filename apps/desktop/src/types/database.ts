@@ -2339,6 +2339,9 @@ export interface QueryTab {
   structureDraft?: TableStructureEditorDraft;
   databaseSearchState?: DatabaseSearchTabState;
   objectBrowser?: {
+    /** The single persistent object navigator follows sidebar selection. */
+    navigator?: boolean;
+    selectedObjectName?: string;
     catalog?: string;
     schema?: string;
     objectType?: "tables";
