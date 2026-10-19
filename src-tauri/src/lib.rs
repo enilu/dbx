@@ -176,21 +176,45 @@ pub(crate) fn linux_compositing_available() -> bool {
     gtk::gdk::Screen::default().is_some_and(|screen| screen.is_composited())
 }
 
+/// Desktops where the transparent floating frame is known to render correctly. Others (notably
+/// KDE, which shows flickering or missing content with some driver/WebKitGTK combinations) keep
+/// the opaque window unless the user forces the frame on.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn should_enable_linux_floating_frame(compositing: bool, opt_in: Option<&std::ffi::OsStr>) -> bool {
-    compositing && opt_in == Some(std::ffi::OsStr::new("1"))
+fn linux_desktop_supports_floating_frame(current_desktop: Option<&std::ffi::OsStr>) -> bool {
+    current_desktop
+        .map(|value| value.to_string_lossy().split(':').any(|name| name.eq_ignore_ascii_case("GNOME")))
+        .unwrap_or(false)
+}
+
+/// `DBX_LINUX_FLOATING_FRAME=1|0` is an optional override; without it the desktop decides.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_enable_linux_floating_frame(
+    compositing: bool,
+    override_value: Option<&std::ffi::OsStr>,
+    current_desktop: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !compositing {
+        return false;
+    }
+    match override_value.and_then(|value| value.to_str()) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => linux_desktop_supports_floating_frame(current_desktop),
+    }
 }
 
 /// The Linux config declares the main window with `create: false` so its transparency can
-/// be explicitly opted into at runtime when a compositor is available.
+/// depend at runtime on the desktop and on whether a compositor is available.
 #[cfg(target_os = "linux")]
 fn create_linux_main_window(app: &tauri::App) -> tauri::Result<()> {
     let Some(config) = app.config().app.windows.iter().find(|window| window.label == "main").cloned() else {
         return Ok(());
     };
     let compositing = linux_compositing_available();
-    let opt_in = std::env::var_os("DBX_LINUX_FLOATING_FRAME");
-    let floating_frame = should_enable_linux_floating_frame(compositing, opt_in.as_deref());
+    let override_value = std::env::var_os("DBX_LINUX_FLOATING_FRAME");
+    let current_desktop = std::env::var_os("XDG_CURRENT_DESKTOP");
+    let floating_frame =
+        should_enable_linux_floating_frame(compositing, override_value.as_deref(), current_desktop.as_deref());
     log::info!("[WINDOW] Linux main window compositing={compositing}; floating_frame={floating_frame}");
     let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.transparent(floating_frame);
     if floating_frame {
@@ -715,7 +739,12 @@ pub(crate) fn request_app_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, ta
     let _ = app.emit(APP_CLOSE_REQUESTED_EVENT, target);
 }
 
-fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
+fn register_deep_link_state<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    // macOS can deliver Opened before setup, so its queue must already exist.
+    builder.manage(commands::deep_link::DeepLinkOpenState::default())
+}
+
+fn open_connection_deep_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>, links: Vec<String>) {
     if links.is_empty() {
         return;
     }
@@ -758,6 +787,7 @@ fn open_plugin_install_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
 enum LocaleFamily {
     Azerbaijani,
     English,
+    Thai,
     SimplifiedChinese,
     TraditionalChinese,
     Japanese,
@@ -766,6 +796,7 @@ enum LocaleFamily {
     Indonesian,
     Italian,
     Portuguese,
+    Polish,
     Russian,
     Turkish,
 }
@@ -787,6 +818,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         }
     } else if is_language("ja") {
         LocaleFamily::Japanese
+    } else if is_language("th") {
+        LocaleFamily::Thai
     } else if is_language("ko") {
         LocaleFamily::Korean
     } else if is_language("az") {
@@ -801,6 +834,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         LocaleFamily::Italian
     } else if is_language("pt") {
         LocaleFamily::Portuguese
+    } else if is_language("pl") {
+        LocaleFamily::Polish
     } else if is_language("ru") {
         LocaleFamily::Russian
     } else {
@@ -812,6 +847,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => ("显示 DBX", "退出 DBX"),
         LocaleFamily::TraditionalChinese => ("顯示 DBX", "退出 DBX"),
+        LocaleFamily::Thai => ("แสดง DBX", "ออกจาก DBX"),
         LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
         LocaleFamily::Korean => ("DBX 표시", "DBX 종료"),
         LocaleFamily::Azerbaijani => ("DBX-i göstər", "DBX-dən çıx"),
@@ -821,6 +857,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::Turkish => ("DBX'i Göster", "DBX'ten Çık"),
         LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
         LocaleFamily::Russian => ("Показать DBX", "Выйти из DBX"),
+        LocaleFamily::Polish => ("Pokaż DBX", "Zakończ DBX"),
         LocaleFamily::English => ("Show DBX", "Quit DBX"),
     }
 }
@@ -831,6 +868,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => "复制支持信息",
         LocaleFamily::TraditionalChinese => "複製支援資訊",
+        LocaleFamily::Thai => "คัดลอกข้อมูลสำหรับขอความช่วยเหลือ",
         LocaleFamily::Japanese => "サポート情報をコピー",
         LocaleFamily::Korean => "지원 정보 복사",
         LocaleFamily::Azerbaijani => "Dəstək məlumatlarını kopyala",
@@ -840,6 +878,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::Turkish => "Destek bilgilerini kopyala",
         LocaleFamily::Portuguese => "Copiar informações",
         LocaleFamily::Russian => "Копировать сведения о поддержке",
+        LocaleFamily::Polish => "Kopiuj informacje o pomocy technicznej",
         LocaleFamily::English => "Copy Support Info",
     }
 }
@@ -849,6 +888,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese => "关闭标签页",
         LocaleFamily::TraditionalChinese => "關閉分頁",
+        LocaleFamily::Thai => "ปิดแท็บ",
         LocaleFamily::Japanese => "タブを閉じる",
         LocaleFamily::Korean => "탭 닫기",
         LocaleFamily::Azerbaijani => "Vərəqi bağla",
@@ -858,6 +898,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
         LocaleFamily::Turkish => "Sekmeyi kapat",
         LocaleFamily::Portuguese => "Fechar aba",
         LocaleFamily::Russian => "Закрыть вкладку",
+        LocaleFamily::Polish => "Zamknij kartę",
         LocaleFamily::English => "Close Tab",
     }
 }
@@ -866,6 +907,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
 fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
     match locale_family(locale) {
         LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
+        LocaleFamily::Thai => format!("ออกจาก {app_name}"),
         LocaleFamily::Japanese => format!("{app_name}を終了"),
         LocaleFamily::Korean => format!("{app_name} 종료"),
         LocaleFamily::Azerbaijani => format!("{app_name}-dən çıx"),
@@ -875,6 +917,7 @@ fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
         LocaleFamily::Turkish => format!("{app_name} Uygulamasından Çık"),
         LocaleFamily::Portuguese => format!("Sair do {app_name}"),
         LocaleFamily::Russian => format!("Выйти из {app_name}"),
+        LocaleFamily::Polish => format!("Zakończ {app_name}"),
         LocaleFamily::English => format!("Quit {app_name}"),
     }
 }
@@ -1079,6 +1122,37 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
     Ok(())
 }
 
+async fn shutdown_runtime_resources(app_handle: &tauri::AppHandle) {
+    if let Some(backups) = app_handle.try_state::<background_backup::BackgroundBackup>() {
+        backups.shutdown().await;
+    }
+    if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>() {
+        server.shutdown(Duration::from_secs(1)).await;
+    }
+    if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+        state.shutdown(Duration::from_secs(3)).await;
+    }
+}
+
+fn run_shutdown_on_dedicated_thread(shutdown: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("dbx-runtime-shutdown".into())
+        .spawn(shutdown)
+        .map_err(|error| format!("failed to start runtime shutdown: {error}"))?
+        .join()
+        .map_err(|_| "runtime shutdown thread panicked".to_string())
+}
+
+pub(crate) fn cleanup_before_updater_forced_exit(app_handle: &tauri::AppHandle) {
+    let shutdown_app = app_handle.clone();
+    if let Err(error) = run_shutdown_on_dedicated_thread(move || {
+        tauri::async_runtime::block_on(shutdown_runtime_resources(&shutdown_app));
+    }) {
+        log::warn!("Failed to shut down DBX runtime resources before updater exit: {error}");
+    }
+    app_handle.cleanup_before_exit();
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -1087,33 +1161,105 @@ mod tests {
         linux_appimage_requires_dmabuf_workaround, linux_drm_driver_is_software_only,
         linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_pci_id_from_sysfs_value,
         linux_selected_drm_render_device, linux_uses_native_wayland, linux_webkit_environment_override,
-        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
-        should_enable_linux_floating_frame, should_enable_single_instance, should_fallback_to_native_quit,
-        should_hide_window_before_exit, should_hide_window_on_close, should_setup_desktop_tray,
-        should_show_main_window_after_setup, should_show_main_window_before_setup_tasks, startup_data_dir_mode,
-        tray_menu_labels_for_locale, uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, run_shutdown_on_dedicated_thread,
+        should_confirm_app_exit_request, should_enable_linux_floating_frame, should_enable_single_instance,
+        should_fallback_to_native_quit, should_hide_window_before_exit, should_hide_window_on_close,
+        should_setup_desktop_tray, should_show_main_window_after_setup, should_show_main_window_before_setup_tasks,
+        startup_data_dir_mode, tray_menu_labels_for_locale, uses_application_level_icon, LinuxDrmRenderDevice,
+        LinuxNvidiaDriver,
     };
     use crate::data_dir::DataDirMode;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     #[test]
-    fn linux_floating_frame_is_disabled_by_default() {
-        assert!(!should_enable_linux_floating_frame(true, None));
-        assert!(!should_enable_linux_floating_frame(false, None));
+    #[cfg(desktop)]
+    fn deep_links_received_before_setup_survive_until_frontend_ready() {
+        use crate::commands::deep_link::{pending_open_connection_links, DeepLinkOpenState};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Listener, Manager};
+
+        let setup_ran = Arc::new(AtomicBool::new(false));
+        let setup_observed = setup_ran.clone();
+        // Use the production registration path, not a test-only manage call.
+        let mut app = super::register_deep_link_state(mock_builder())
+            .setup(move |_| {
+                setup_observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        assert!(!setup_ran.load(Ordering::SeqCst));
+        assert!(app.try_state::<DeepLinkOpenState>().is_some());
+
+        let emitted = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let observed = emitted.clone();
+        app.listen("dbx-open-connection-links", move |event| {
+            observed.lock().unwrap().push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let first = "dbx://connection/new?type=mysql&one_time=true".to_string();
+        let second = "dbx://connection/new?type=postgres&one_time=false".to_string();
+        super::open_connection_deep_links(app.handle(), vec![first.clone()]);
+        super::open_connection_deep_links(app.handle(), vec![first.clone(), second.clone()]);
+        assert!(emitted.lock().unwrap().is_empty());
+
+        // Tauri runs setup here even though MockRuntime's iteration is a no-op.
+        // A single iteration avoids the busy-loop the deprecation warns about.
+        #[allow(deprecated)]
+        app.run_iteration(|_, _| {});
+        assert!(setup_ran.load(Ordering::SeqCst));
+        assert!(emitted.lock().unwrap().is_empty());
+        assert_eq!(pending_open_connection_links(app.state()), vec![first, second]);
+        assert!(pending_open_connection_links(app.state()).is_empty());
+
+        let warm = "dbx://connection/new?type=mysql&host=localhost".to_string();
+        super::open_connection_deep_links(app.handle(), vec![warm.clone()]);
+        assert_eq!(*emitted.lock().unwrap(), vec![vec![warm]]);
+        assert!(pending_open_connection_links(app.state()).is_empty());
     }
 
     #[test]
-    fn linux_floating_frame_requires_explicit_opt_in() {
-        assert!(should_enable_linux_floating_frame(true, Some(OsStr::new("1"))));
-        for value in ["", "0", "false", "true", "auto", "yes", "01"] {
-            assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new(value))));
+    fn forced_exit_shutdown_waits_for_a_dedicated_cleanup_thread() {
+        let caller = std::thread::current().id();
+        let cleanup_thread = Arc::new(Mutex::new(None));
+        let observed_thread = cleanup_thread.clone();
+
+        run_shutdown_on_dedicated_thread(move || {
+            *observed_thread.lock().unwrap() = Some(std::thread::current().id());
+        })
+        .unwrap();
+
+        let cleanup_thread = cleanup_thread.lock().unwrap().expect("cleanup thread id");
+        assert_ne!(cleanup_thread, caller);
+    }
+
+    #[test]
+    fn linux_floating_frame_is_enabled_by_default_on_gnome_only() {
+        for desktop in ["GNOME", "ubuntu:GNOME", "gnome", "GNOME-Classic:GNOME"] {
+            assert!(should_enable_linux_floating_frame(true, None, Some(OsStr::new(desktop))), "{desktop}");
+        }
+        for desktop in ["KDE", "XFCE", "X-Cinnamon", "sway", "", "GNOMEISH"] {
+            assert!(!should_enable_linux_floating_frame(true, None, Some(OsStr::new(desktop))), "{desktop}");
+        }
+        assert!(!should_enable_linux_floating_frame(true, None, None));
+    }
+
+    #[test]
+    fn linux_floating_frame_override_wins_over_desktop() {
+        assert!(should_enable_linux_floating_frame(true, Some(OsStr::new("1")), Some(OsStr::new("KDE"))));
+        assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new("0")), Some(OsStr::new("GNOME"))));
+        for value in ["", "true", "auto", "01"] {
+            assert!(should_enable_linux_floating_frame(true, Some(OsStr::new(value)), Some(OsStr::new("GNOME"))));
+            assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new(value)), Some(OsStr::new("KDE"))));
         }
     }
 
     #[test]
-    fn linux_floating_frame_requires_compositing_even_when_opted_in() {
-        assert!(!should_enable_linux_floating_frame(false, Some(OsStr::new("1"))));
+    fn linux_floating_frame_requires_compositing() {
+        assert!(!should_enable_linux_floating_frame(false, Some(OsStr::new("1")), Some(OsStr::new("GNOME"))));
+        assert!(!should_enable_linux_floating_frame(false, None, Some(OsStr::new("GNOME"))));
     }
 
     #[test]
@@ -1126,6 +1272,8 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("zh-Hant-HK"), ("顯示 DBX", "退出 DBX"));
         assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 DBX", "退出 DBX"));
         assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
+        assert_eq!(tray_menu_labels_for_locale("th-TH"), ("แสดง DBX", "ออกจาก DBX"));
+        assert_eq!(tray_menu_labels_for_locale("th_TH"), ("แสดง DBX", "ออกจาก DBX"));
         assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("DBX 표시", "DBX 종료"));
         assert_eq!(tray_menu_labels_for_locale("az-AZ"), ("DBX-i göstər", "DBX-dən çıx"));
         assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar DBX", "Salir de DBX"));
@@ -1134,6 +1282,8 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
         assert_eq!(tray_menu_labels_for_locale("tr-TR"), ("DBX'i Göster", "DBX'ten Çık"));
         assert_eq!(tray_menu_labels_for_locale("ru-RU"), ("Показать DBX", "Выйти из DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pl-PL"), ("Pokaż DBX", "Zakończ DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pl_PL"), ("Pokaż DBX", "Zakończ DBX"));
         assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
         // Unknown and empty locales fall back to English; "ita" must not match "it".
         assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));
@@ -1145,6 +1295,8 @@ mod tests {
         assert_eq!(app_menu_quit_label("zh-CN", "DBX"), "退出 DBX");
         assert_eq!(app_menu_quit_label("zh-TW", "DBX"), "退出 DBX");
         assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
+        assert_eq!(app_menu_quit_label("th-TH", "DBX"), "ออกจาก DBX");
+        assert_eq!(app_menu_quit_label("th_TH", "DBX"), "ออกจาก DBX");
         assert_eq!(app_menu_quit_label("ko-KR", "DBX"), "DBX 종료");
         assert_eq!(app_menu_quit_label("tr-TR", "DBX"), "DBX Uygulamasından Çık");
         assert_eq!(app_menu_quit_label("ru-RU", "DBX"), "Выйти из DBX");
@@ -1154,6 +1306,7 @@ mod tests {
         assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
         assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
         assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
+        assert_eq!(app_menu_copy_support_info_label("th-TH"), "คัดลอกข้อมูลสำหรับขอความช่วยเหลือ");
         assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
         assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
         assert_eq!(app_menu_copy_support_info_label("ru-RU"), "Копировать сведения о поддержке");
@@ -1163,6 +1316,7 @@ mod tests {
         assert_eq!(app_menu_close_tab_label("zh-CN"), "关闭标签页");
         assert_eq!(app_menu_close_tab_label("zh-TW"), "關閉分頁");
         assert_eq!(app_menu_close_tab_label("ja-JP"), "タブを閉じる");
+        assert_eq!(app_menu_close_tab_label("th-TH"), "ปิดแท็บ");
         assert_eq!(app_menu_close_tab_label("en-US"), "Close Tab");
     }
 
@@ -1567,7 +1721,7 @@ pub fn run() {
 
     let startup_begin = Instant::now();
 
-    let builder = tauri::Builder::default()
+    let builder = register_deep_link_state(tauri::Builder::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1809,6 +1963,7 @@ pub fn run() {
             app.manage(state.clone());
             commands::plugins::install_plugin_event_bridge(app.handle(), state.clone());
             commands::connection::install_connection_liveness_bridge(app.handle(), state.clone());
+            commands::connection::install_connection_idle_closed_bridge(app.handle(), state.clone());
             let app_identifier = app.config().identifier.clone();
             let backups = tauri::async_runtime::block_on(async {
                 background_backup::BackgroundBackup::new(state.clone(), data_dir.clone(), app_identifier)
@@ -1834,7 +1989,6 @@ pub fn run() {
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
-            app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(commands::update::PendingUpdateState::default());
             app.manage(commands::ssh_prompt::SshPromptState::new());
             commands::ssh_prompt::install_ssh_prompt_bridge(app.handle());
@@ -1983,6 +2137,7 @@ pub fn run() {
             commands::ai_multi_config::save_ai_config_item,
             commands::ai_multi_config::delete_ai_config,
             commands::cc_switch::load_cc_switch_ai_configs,
+            commands::cc_switch::load_magpie_ai_configs,
             commands::prompt_template::load_prompt_templates,
             commands::prompt_template::save_prompt_template,
             commands::prompt_template::delete_prompt_template,
@@ -2062,6 +2217,9 @@ pub fn run() {
             commands::cloud_sync::snippet_token_status,
             commands::cloud_sync::save_snippet_saved_token,
             commands::cloud_sync::forget_snippet_saved_token,
+            commands::cloud_sync::snippet_passphrase_status,
+            commands::cloud_sync::save_snippet_saved_passphrase,
+            commands::cloud_sync::forget_snippet_saved_passphrase,
             commands::cloud_sync::snippet_sync_settings,
             commands::cloud_sync::save_snippet_sync_id,
             commands::cloud_sync::retry_snippet_legacy_cleanup,
@@ -2231,9 +2389,16 @@ pub fn run() {
             commands::query::build_duplicate_table_structure_sql,
             commands::query::build_copy_table_data_sql,
             commands::query::build_executable_object_source_statements,
+            commands::query::validate_oracle_executable_object_source,
+            commands::query::fingerprint_oracle_routine_object_source,
             commands::query::build_executable_object_source_sql,
             commands::query::build_editable_object_source,
             commands::query::build_routine_rename_object_source_statements,
+            commands::query::rewrite_oracle_routine_references,
+            commands::query::rewrite_oracle_table_references,
+            commands::query::parse_oracle_object_name,
+            commands::query::build_oracle_view_rename_source,
+            commands::query::review_oracle_view_rename_source,
             commands::query::build_view_ddl_sql,
             commands::query::build_table_structure_change_sql,
             commands::query::build_table_owner_change_sql,
@@ -2419,6 +2584,7 @@ pub fn run() {
             commands::saved_sql::save_saved_sql_folder,
             commands::saved_sql::delete_saved_sql_folder,
             commands::saved_sql::save_saved_sql_file,
+            commands::saved_sql::save_default_query_content,
             commands::saved_sql::delete_saved_sql_file,
             commands::saved_sql::saved_sql_storage_dir,
             commands::saved_sql::open_saved_sql_storage_dir,
@@ -2705,6 +2871,8 @@ pub fn run() {
             commands::task_history::load_task_run,
             commands::task_history::load_task_run_items,
             commands::mcp::check_mcp_server_status,
+            commands::mcp::check_mcp_keychain_access,
+            commands::mcp::authorize_mcp_keychain,
             commands::mcp::install_mcp_server,
             commands::mcp::install_native_mcp_server,
             commands::mcp::uninstall_mcp_server,
@@ -2808,18 +2976,7 @@ pub fn run() {
                             let _ = window.hide();
                         }
                     }
-                    tauri::async_runtime::block_on(async {
-                        if let Some(backups) = app_handle.try_state::<background_backup::BackgroundBackup>() {
-                            backups.shutdown().await;
-                        }
-                        if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>()
-                        {
-                            server.shutdown(Duration::from_secs(1)).await;
-                        }
-                        if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
-                            state.shutdown(Duration::from_secs(3)).await;
-                        }
-                    });
+                    tauri::async_runtime::block_on(shutdown_runtime_resources(app_handle));
                 }
             }
 

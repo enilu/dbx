@@ -10,9 +10,6 @@ import { shouldBlockAppUpdate } from "@/lib/app/appUpdateTaskGuard";
 import { uuid } from "@/lib/common/utils";
 import { isUpdatePreviewMockEnabled, previewAppUpdateInfo } from "@/lib/updates/updatePreviewMock";
 
-// Personal portable builds must not replace themselves with an upstream release.
-const appUpdaterDisabled = import.meta.env.VITE_DBX_DISABLE_APP_UPDATER === "true";
-
 interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
   prepareForUpdate?: () => Promise<() => void>;
@@ -134,6 +131,8 @@ export async function resolveUpdaterProxy(): Promise<string | undefined> {
 export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const { t } = useI18n();
   const settingsStore = useSettingsStore();
+  // Personal portable builds must not replace themselves with an upstream release.
+  const updaterDisabled = import.meta.env.VITE_DBX_DISABLE_UPDATER === "1" || import.meta.env.VITE_DBX_DISABLE_APP_UPDATER === "true";
   type Phase = "idle" | "checking" | "downloading" | "ready" | "preparing" | "installing" | "restart";
   const phase = ref<Phase>("idle");
   const downloaded = ref<api.DownloadedUpdate | null>(null);
@@ -226,7 +225,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     return t("updates.installFailed", { error: message });
   }
   async function checkUpdates(checkOptions: { silent?: boolean } = {}) {
-    if (appUpdaterDisabled) {
+    if (updaterDisabled) {
       if (!checkOptions.silent) {
         updateCheckMessage.value = "Updates are disabled for this Shanghai trial build.";
         showUpdateDialog.value = true;
@@ -291,8 +290,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function downloadUpdateInBackground(automatic = false) {
-    if (appUpdaterDisabled) return;
-    if (disposed || isIgnoringUpdate.value || phase.value !== "idle" || downloaded.value || !canDownloadAndInstallUpdate(updateInfo.value, isTauriRuntime())) return;
+    if (updaterDisabled || disposed || isIgnoringUpdate.value || phase.value !== "idle" || downloaded.value || !canDownloadAndInstallUpdate(updateInfo.value, isTauriRuntime())) return;
     if (automatic && !autoUpdateEnabled.value) return;
     automaticDownload = automatic;
     const version = updateInfo.value!.latest_version;
@@ -396,7 +394,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function performInstall(restartOnly: boolean) {
-    if (appUpdaterDisabled) return;
+    if (updaterDisabled) return;
     if (!isTauriRuntime() || isInstallingUpdate.value || isIgnoringUpdate.value || (!restartOnly && !downloaded.value)) return;
     const cache = downloaded.value;
     let release: (() => void) | undefined;
@@ -446,14 +444,15 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function installDownloadedUpdate() {
+    if (updaterDisabled) return;
     await performInstall(false);
   }
   async function restartApp() {
+    if (updaterDisabled) return;
     if (updateReady.value) await performInstall(true);
   }
   async function initialize() {
-    if (appUpdaterDisabled) return;
-    if (initialized || disposed) return;
+    if (updaterDisabled || initialized || disposed) return;
     initialized = true;
     if (isTauriRuntime()) {
       phase.value = "checking";

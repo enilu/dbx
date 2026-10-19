@@ -55,6 +55,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
+import { encodeOceanBaseUrlUsername } from "@/lib/connection/connectionUrlBuilder";
 import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
 import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, isSidebarCommentSupportedType, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import {
@@ -79,7 +80,7 @@ import { findTreeNodeById } from "@/lib/sql/newQueryContext";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { redactConnectionStringSecrets } from "@/lib/connection/connectionStringRedaction";
-import { isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
+import { isExecuteSqlShortcut, isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
@@ -555,7 +556,8 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
   const scheme = connectionDisplayUrlScheme(config);
   const port = Number(config.port) > 0 ? `:${config.port}` : "";
   const user = cleanTooltipValue(config.username);
-  const userInfo = user ? `${encodeURIComponent(user)}@` : "";
+  const encodedUser = config.db_type === "mysql" && config.driver_profile?.trim().toLowerCase() === "oceanbase" ? encodeOceanBaseUrlUsername(user) : encodeURIComponent(user).replace(/%40/g, "@");
+  const userInfo = user ? `${encodedUser}@` : "";
   const database = tooltipDatabaseValue(config);
   const encodedDatabase = config.db_type === "spanner" ? encodeSpannerResourcePath(database) : encodeURIComponent(database);
   const path = database ? `/${encodedDatabase}` : "";
@@ -934,7 +936,8 @@ function refreshTrailingCommentMeasurement() {
 }
 
 function formattedObjectStorage(): string {
-  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size" || (activeNode.value.type !== "database" && activeNode.value.type !== "table" && activeNode.value.type !== "materialized_view")) return "";
+  const mode = settingsStore.editorSettings.sidebarObjectInfoMode;
+  if ((mode !== "size" && mode !== "comment-and-size") || (activeNode.value.type !== "database" && activeNode.value.type !== "table" && activeNode.value.type !== "materialized_view")) return "";
   return formatSidebarObjectStorage(activeNode.value.sizeBytes);
 }
 
@@ -942,7 +945,11 @@ function formattedObjectStorage(): string {
 // 后留下一大段空白。无论全局是 aligned 还是 inline，连接节点的 comment 都紧跟 label。
 const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" && activeNode.value.type !== "connection" ? props.commentLabelWidth : undefined));
 
-function alignedCommentLeadingStyle(): { width: string } | undefined {
+function alignedCommentLeadingStyle(): { width: string } | { maxWidth: string } | undefined {
+  if (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-and-size" && trailingComment.value) {
+    // Reserve the inline comment's margin so a long name cannot push into the size column.
+    return { maxWidth: "max(0px, calc(100% - 1rem))" };
+  }
   const width = alignedCommentLeadingWidth(alignedCommentLabelWidth.value, canTreeNodePin(activeNode.value.type));
   return width === undefined ? undefined : { width: `${width}px` };
 }
@@ -1081,6 +1088,10 @@ function onTableSearchControlKeydown(event: KeyboardEvent) {
     input?.focus();
     input?.select();
   }
+  // Let the app-level shortcut handler open the database default query while
+  // the table-search input remains focused. Other tree-local key handling
+  // must stay contained in the search control.
+  if (isExecuteSqlShortcut(event, settingsStore.editorSettings.shortcuts)) return;
   event.stopPropagation();
 }
 
@@ -1696,7 +1707,7 @@ function onKeydown(event: KeyboardEvent) {
             <Ban class="h-2.5 w-2.5 stroke-[3]" aria-hidden="true" />
           </span>
         </span>
-        <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
+        <div ref="trailingCommentLayoutRef" :class="[hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents', { 'overflow-hidden': settingsStore.editorSettings.sidebarObjectInfoMode === 'comment-and-size' }]">
           <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
               v-if="isRenamingGroup || isRenamingSavedSql || isRenamingConnection"

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addConfiguredAiModel, aiModelOptions, generateId, prepareImportedAiConfigs } from "@/lib/ai/aiConfigList";
+import { addConfiguredAiModel, aiModelOptions, generateId, prepareImportedAiConfigs, removeConfiguredAiModel } from "@/lib/ai/aiConfigList";
 
 describe("generateId", () => {
   afterEach(() => {
@@ -51,6 +51,13 @@ describe("AI model options", () => {
   it("persists a manual model only once", () => {
     expect(addConfiguredAiModel([{ name: "ark-code-latest" }], "  doubao-seed-2.0-code  ")).toEqual([{ name: "ark-code-latest" }, { name: "doubao-seed-2.0-code" }]);
     expect(addConfiguredAiModel([{ name: "ark-code-latest" }], "ark-code-latest")).toEqual([{ name: "ark-code-latest" }]);
+  });
+
+  it("removes a configured manual model", () => {
+    expect(removeConfiguredAiModel([{ name: "ark-code-latest" }, { name: "doubao-seed-2.0-code" }], "doubao-seed-2.0-code")).toEqual([{ name: "ark-code-latest" }]);
+    expect(removeConfiguredAiModel([{ name: "ark-code-latest" }], "non-existent")).toEqual([{ name: "ark-code-latest" }]);
+    expect(removeConfiguredAiModel(undefined, "model")).toEqual([]);
+    expect(removeConfiguredAiModel([{ name: "ark-code-latest" }], "   ")).toEqual([{ name: "ark-code-latest" }]);
   });
 
   it("merges saved metadata with discovered capabilities", () => {
@@ -111,5 +118,51 @@ describe("CC-SWITCH imports", () => {
         ],
       ).map((config) => config.name),
     ).toEqual(["Gateway (CC-SWITCH)", "Gateway (CC-SWITCH 2)"]);
+  });
+
+  it("keeps distinct profiles with matching connection settings and skips them on re-import", () => {
+    const profiles = [
+      {
+        id: "codex-profile",
+        name: "Codex Gateway",
+        provider: "openai-compatible" as const,
+        apiKey: "shared-key",
+        authMethod: "bearer" as const,
+        endpoint: "https://gateway.example",
+        model: "gpt-test",
+        apiStyle: "responses" as const,
+      },
+      {
+        id: "claude-profile",
+        name: "Claude Gateway",
+        provider: "openai-compatible" as const,
+        apiKey: "shared-key",
+        authMethod: "bearer" as const,
+        endpoint: "https://gateway.example",
+        model: "gpt-test",
+        apiStyle: "responses" as const,
+      },
+    ];
+
+    const prepared = prepareImportedAiConfigs([], profiles);
+
+    expect(prepared.map((config) => config.name)).toEqual(["Codex Gateway", "Claude Gateway"]);
+    expect(prepareImportedAiConfigs(prepared, profiles)).toEqual([]);
+  });
+
+  it("collapses exact duplicates inside a single import batch", () => {
+    const config = {
+      id: "first",
+      name: "Gateway",
+      provider: "openai-compatible" as const,
+      apiKey: "secret",
+      authMethod: "bearer" as const,
+      endpoint: "https://gateway.example",
+      model: "gpt-test",
+      apiStyle: "responses" as const,
+    };
+    const duplicate = { ...config, id: "second" };
+
+    expect(prepareImportedAiConfigs([], [config, duplicate])).toEqual([{ ...config, name: "Gateway", isDefault: false }]);
   });
 });

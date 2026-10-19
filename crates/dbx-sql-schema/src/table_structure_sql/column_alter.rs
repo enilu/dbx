@@ -752,11 +752,24 @@ pub(super) fn build_oracle_like_existing_column_sql(
     let mut statements = Vec::new();
     let mut current_name = original.name.clone();
     if column.name != original.name {
-        statements.push(format!(
-            "ALTER TABLE {table} RENAME COLUMN {} TO {};",
-            quote_ident(dialect, &original.name),
-            quote_ident(dialect, &column.name)
-        ));
+        // Dameng accepts the Oracle-style MODIFY (…) but not `RENAME COLUMN`:
+        // the supported form is `ALTER COLUMN old RENAME TO new` (verified on
+        // DM8 8.1.3.62). Oracle and the other Oracle-compatible dialects keep
+        // the RENAME COLUMN form.
+        let rename = if dialect == StructureDialect::Dameng {
+            format!(
+                "ALTER TABLE {table} ALTER COLUMN {} RENAME TO {};",
+                quote_ident(dialect, &original.name),
+                quote_ident(dialect, &column.name)
+            )
+        } else {
+            format!(
+                "ALTER TABLE {table} RENAME COLUMN {} TO {};",
+                quote_ident(dialect, &original.name),
+                quote_ident(dialect, &column.name)
+            )
+        };
+        statements.push(rename);
         current_name = column.name.clone();
     }
     let type_changed = column.data_type.trim() != original.data_type.trim();
@@ -808,6 +821,7 @@ pub(super) fn build_saphana_existing_column_sql(table: &str, column: &EditableSt
     let type_changed = column.data_type.trim() != original.data_type.trim();
     let nullable_changed = column.is_nullable != original.is_nullable;
     let default_changed = normalize_default(Some(&column.default_value)) != original_default(column);
+    let comment_changed = clean(&column.comment) != original_comment(column);
     if type_changed || nullable_changed || default_changed {
         let mut parts = vec![
             quote_ident(StructureDialect::SapHana, &current_name),
@@ -826,6 +840,14 @@ pub(super) fn build_saphana_existing_column_sql(table: &str, column: &EditableSt
             parts.push(if column.is_nullable { "NULL" } else { "NOT NULL" }.to_string());
         }
         statements.push(format!("ALTER TABLE {table} ALTER ({});", parts.join(" ")));
+    }
+    if comment_changed {
+        let comment_value =
+            if clean(&column.comment).is_empty() { "NULL".to_string() } else { quote_string(&clean(&column.comment)) };
+        statements.push(format!(
+            "COMMENT ON COLUMN {table}.{} IS {comment_value};",
+            quote_ident(StructureDialect::SapHana, &current_name)
+        ));
     }
     statements
 }
