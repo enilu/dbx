@@ -179,6 +179,29 @@ export function selectConnectionConfigBundle(bundle: ConnectionConfigBundle, sel
   };
 }
 
+/** Restore passwords to matching SSH plugin connections imported earlier without credentials. */
+export function missingSshPasswordsFromImport(source: Iterable<ConnectionConfig>, existing: Iterable<ConnectionConfig>): ConnectionConfig[] {
+  const byIdentity = new Map<string, ConnectionConfig[]>();
+  for (const connection of existing) {
+    const key = connectionIdentity(connection);
+    const matches = byIdentity.get(key) ?? [];
+    matches.push(connection);
+    byIdentity.set(key, matches);
+  }
+  const restored: ConnectionConfig[] = [];
+  const usedIds = new Set<string>();
+  for (const candidate of source) {
+    if (candidate.db_type !== "plugin" || candidate.plugin_id !== "io.dbx.ssh" || candidate.plugin_connection_provider !== "io.dbx.ssh.connection" || !candidate.password || candidate.save_password === false) continue;
+    const matches = byIdentity.get(connectionIdentity(candidate));
+    if (matches?.length !== 1) continue;
+    const current = matches[0]!;
+    if (current.db_type !== "plugin" || current.plugin_id !== candidate.plugin_id || current.plugin_connection_provider !== candidate.plugin_connection_provider || current.save_password !== false || current.password || usedIds.has(current.id)) continue;
+    usedIds.add(current.id);
+    restored.push({ ...current, password: candidate.password, save_password: true });
+  }
+  return restored;
+}
+
 /** Ordinary file imports deduplicate connections while keeping cloud sync's ID merge policy separate. */
 export function prepareConnectionConfigImport(bundle: ConnectionConfigBundle, existingConnections: Iterable<Pick<ConnectionConfig, "id" | "name" | "host" | "port"> | string>, existingTunnelProfileIds: Iterable<string>, createId: () => string): ConnectionConfigBundle {
   const existingConnectionList = Array.from(existingConnections);

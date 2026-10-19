@@ -97,6 +97,7 @@ import {
 } from "@/lib/table/tableVGroup";
 import {
   buildConnectionConfigBundle,
+  missingSshPasswordsFromImport,
   parseConnectionConfigObject,
   prepareConnectionConfigImport,
   selectConnectionConfigBundle,
@@ -10435,6 +10436,8 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function applyConnectionsImport(preview: ConnectionConfigBundle, selectedConnectionIds?: Iterable<string>): Promise<{ count: number; layout?: SidebarLayout }> {
     const selected = selectConnectionConfigBundle(preview, selectedConnectionIds);
+    const passwordRestorations = missingSshPasswordsFromImport(selected.connections, connections.value);
+    for (const connection of passwordRestorations) await updateConnection(connection);
     const importedTunnelProfileStore = useTunnelProfileStore();
     await importedTunnelProfileStore.init();
     const imported = prepareConnectionConfigImport(
@@ -10447,7 +10450,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await importedTunnelProfileStore.saveProfiles([...importedTunnelProfileStore.profiles, ...imported.tunnelProfiles]);
     }
     for (const connection of imported.connections) await addConnection(normalizeConnection(connection));
-    return { count: imported.connections.length, layout: imported.layout };
+    return { count: imported.connections.length + passwordRestorations.length, layout: imported.layout };
   }
 
   async function importConnectionsFromFile(content: string, passphrase: string | null, selectedConnectionIds?: Iterable<string>): Promise<{ count: number; layout?: SidebarLayout }> {

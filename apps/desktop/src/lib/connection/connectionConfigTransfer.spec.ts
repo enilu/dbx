@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ConnectionConfig, SidebarLayout, TunnelProfile } from "@/types/database";
-import { buildConnectionConfigBundle, parseConnectionConfigObject, prepareConnectionConfigImport, scrubConnectionForPlaintextExport, scrubTunnelProfileForPlaintextExport, selectConnectionConfigBundle, snapshotConnectionsForExport } from "./connectionConfigTransfer";
+import { buildConnectionConfigBundle, missingSshPasswordsFromImport, parseConnectionConfigObject, prepareConnectionConfigImport, scrubConnectionForPlaintextExport, scrubTunnelProfileForPlaintextExport, selectConnectionConfigBundle, snapshotConnectionsForExport } from "./connectionConfigTransfer";
 
 function conn(id: string, name: string, extras: Partial<ConnectionConfig> = {}): ConnectionConfig {
   return {
@@ -173,5 +173,23 @@ describe("connectionConfigTransfer", () => {
     expect(selected.connections.map((connection) => connection.id)).toEqual(["a", "c"]);
     expect(preview.connections).toHaveLength(3);
     expect(selected.layout?.order.some((entry) => entry.type === "connection" && entry.id === "d")).toBe(false);
+  });
+
+  it("restores only missing passwords on unambiguous matching SSH plugin connections", () => {
+    const ssh = (id: string, name: string, password: string, savePassword: boolean) =>
+      conn(id, name, {
+        db_type: "plugin",
+        host: "server.example",
+        port: 22,
+        plugin_id: "io.dbx.ssh",
+        plugin_connection_provider: "io.dbx.ssh.connection",
+        plugin_connection_type: "ssh",
+        password,
+        save_password: savePassword,
+      });
+    const existing = [ssh("target", "Target", "", false), ssh("saved", "Saved", "existing", true), ssh("ambiguous-a", "Ambiguous", "", false), ssh("ambiguous-b", "Ambiguous", "", false)];
+    const source = [ssh("import-target", "Target", "recovered", true), ssh("import-saved", "Saved", "replacement", true), ssh("import-ambiguous", "Ambiguous", "recovered", true), conn("other", "Other", { password: "irrelevant" })];
+    expect(missingSshPasswordsFromImport(source, existing)).toEqual([{ ...existing[0], password: "recovered", save_password: true }]);
+    expect(existing[0].password).toBe("");
   });
 });
