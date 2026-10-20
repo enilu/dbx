@@ -250,6 +250,7 @@ enum ConnectionDatabaseInfoSource {
         session: Arc<PluginDriverSession>,
     },
     NativeMysql(db::mysql::MySqlPool),
+    NativeGaussdbDws(deadpool_postgres::Pool),
     NativeHBase(db::hbase_driver::HBaseClient),
     NativeMongo(mongodb::Client, Option<String>),
     Meilisearch(db::meilisearch_driver::MeilisearchClient),
@@ -259,6 +260,12 @@ enum ConnectionDatabaseInfoSource {
     Consul(Box<crate::consul::ConsulClient>),
     #[cfg(feature = "mq-admin")]
     MessageQueue,
+}
+
+async fn gaussdb_dws_product_version_from_pool(pool: &deadpool_postgres::Pool) -> Option<String> {
+    let result = db::postgres::execute_query_with_max_rows(pool, "SELECT version()", Some(1)).await.ok()?;
+    let server_version = result.rows.first()?.first()?.as_str()?;
+    crate::query::plugin_plan::gaussdb_product_version_from_server_version(server_version)
 }
 
 /// Held connection for a manual transaction session
@@ -1567,6 +1574,21 @@ impl AppState {
     pub async fn update_connection_pools<R>(&self, update: impl FnOnce(&mut ConnectionPoolRegistry) -> R) -> R {
         let mut connections = self.connections.write().await;
         update(&mut connections)
+    }
+
+    /// Test-only: the pool key a workload session uses. Tests that inject a
+    /// pool instead of opening a real connection need the exact session key the
+    /// executor will look up.
+    #[cfg(test)]
+    pub(crate) async fn session_pool_key_for_test(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) -> String {
+        let config = self.configs.read().await.get(connection_id).cloned();
+        let base_pool_key = base_pool_key_for_config(config.as_ref(), connection_id, database, None, false);
+        pool_key_for_session_role(config.as_ref(), base_pool_key, Some(client_session_id), AgentSessionRole::Workload)
     }
 
     fn pool_routing_control(&self) -> PoolRoutingControl {
@@ -5469,6 +5491,11 @@ impl AppState {
                         session: session.clone(),
                     })
                 }
+                Some(PoolKind::Postgres(pool))
+                    if crate::query::plugin_plan::is_explicit_gaussdb_dws_profile(&config) =>
+                {
+                    Some(ConnectionDatabaseInfoSource::NativeGaussdbDws(pool.clone()))
+                }
                 Some(PoolKind::Mysql(pool, _)) => Some(ConnectionDatabaseInfoSource::NativeMysql(pool.clone())),
                 Some(PoolKind::HBase(client)) => Some(ConnectionDatabaseInfoSource::NativeHBase(client.clone())),
                 Some(PoolKind::MongoDb(client)) => {
@@ -5515,6 +5542,21 @@ impl AppState {
             }
             Some(ConnectionDatabaseInfoSource::NativeMysql(pool)) => {
                 db::mysql::database_connection_info(&pool, db::mysql::protocol_product_name(&config)).await.map(Some)
+            }
+            Some(ConnectionDatabaseInfoSource::NativeGaussdbDws(pool)) => {
+                // Version discovery is optional metadata. If the query or product
+                // marker is unavailable, return versionless info; plan support is
+                // determined by the explicit DWS profile, not the product version.
+                let product_version = gaussdb_dws_product_version_from_pool(&pool).await;
+                Ok(Some(DatabaseConnectionInfo {
+                    product_name: Some("GaussDB".to_string()),
+                    product_version: product_version.map(|version| format!("GaussDB {version}")),
+                    current_database: database
+                        .map(str::to_string)
+                        .or_else(|| config.effective_database().map(str::to_string)),
+                    driver_name: Some("DBX PostgreSQL-compatible driver".to_string()),
+                    ..Default::default()
+                }))
             }
             Some(ConnectionDatabaseInfoSource::NativeHBase(client)) => {
                 db::hbase_driver::database_connection_info(&client).await
