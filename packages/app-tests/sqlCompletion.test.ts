@@ -347,7 +347,10 @@ test("suggests MySQL AES functions with required arguments, including through JD
       columnsByTable: new Map(),
       databaseType,
     });
-    assert.equal(items.some((item) => item.type === "function" && (item.label === "AES_ENCRYPT" || item.label === "AES_DECRYPT")), false);
+    assert.equal(
+      items.some((item) => item.type === "function" && (item.label === "AES_ENCRYPT" || item.label === "AES_DECRYPT")),
+      false,
+    );
   }
 });
 
