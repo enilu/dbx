@@ -3,6 +3,7 @@ mod agent_skill;
 use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
 use dbx_core::{
+    db::redis_driver::{classify_command, parse_command_argv, RedisCommandResult, RedisCommandSafety},
     models::connection::{ConnectionConfig, DatabaseType},
     production_safety::{is_production_database, targets_production_database},
     sql_risk::{classify_sql_risk_for_database, SqlRisk},
@@ -20,9 +21,9 @@ use serde_json::{json, Map, Value};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DIRECT_QUERY_TYPES: &[&str] =
     &["postgres", "redshift", "mysql", "doris", "starrocks", "manticoresearch", "sqlite", "rqlite", "kwdb", "questdb"];
+const DIRECT_COMMAND_TYPES: &[&str] = &["redis"];
 const BRIDGE_REQUIRED_TYPES: &[&str] = &[
     "cloudflare-d1",
-    "redis",
     "mongodb",
     "duckdb",
     "clickhouse",
@@ -99,6 +100,7 @@ struct Flags {
     max_tables: Option<usize>,
     max_rows: Option<usize>,
     timeout_ms: Option<u64>,
+    max_output_bytes: Option<usize>,
     file: Option<PathBuf>,
     out: Option<PathBuf>,
     notes: Option<PathBuf>,
@@ -106,6 +108,7 @@ struct Flags {
     skills_dir: Option<PathBuf>,
     allow_writes: bool,
     allow_dangerous: bool,
+    allow_dangerous_redis: bool,
     force: bool,
     help: bool,
     version: bool,
@@ -158,6 +161,7 @@ struct Diagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     bridge_url: Option<String>,
     direct_query_types: Vec<&'static str>,
+    direct_command_types: Vec<&'static str>,
     bridge_required_types: Vec<&'static str>,
 }
 
@@ -257,6 +261,9 @@ async fn run_with_backend(backend: &dyn DbxBackend, flags: Flags) -> Result<Stri
     }
     if args.first().is_some_and(|arg| arg == "query") {
         return run_query(backend, &flags).await;
+    }
+    if args.first().is_some_and(|arg| arg == "redis") {
+        return run_redis(backend, &flags).await;
     }
     if args.first().is_some_and(|arg| arg == "context") {
         return run_context(backend, &flags).await;
@@ -394,6 +401,117 @@ async fn run_query(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, Cl
         .await
         .map_err(command_error)?;
     format_query(connection_name, &result, flags.format)
+}
+
+async fn run_redis(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, CliError> {
+    ensure_arg_count(&flags.args, 3, "dbx redis <connection> <command>")?;
+    if flags.format == OutputFormat::Csv {
+        return Err(CliError::new("INVALID_OPTION", "CSV format is not supported for dbx redis."));
+    }
+    if flags.file.is_some() || flags.allow_dangerous {
+        return Err(CliError::new(
+            "INVALID_OPTION",
+            "Use an inline Redis command and --allow-dangerous-redis for high-risk Redis commands.",
+        ));
+    }
+    if flags.allow_dangerous_redis && !flags.allow_writes {
+        return Err(CliError::new("INVALID_OPTION", "--allow-dangerous-redis requires --allow-writes."));
+    }
+    let connection_name = &flags.args[1];
+    let command = &flags.args[2];
+    let connection = find_connection(backend, connection_name).await?;
+    if connection.db_type != DatabaseType::Redis {
+        return Err(CliError::new(
+            "INVALID_CONNECTION_TYPE",
+            format!("Connection \"{connection_name}\" is not Redis."),
+        ));
+    }
+    let database = selected_database(&connection, flags.database.as_deref());
+    let database = if database.is_empty() {
+        0
+    } else {
+        database
+            .parse::<u32>()
+            .map_err(|_| CliError::new("INVALID_DATABASE", "Redis database must be a non-negative integer."))?
+    };
+    let argv = parse_command_argv(command).map_err(|message| CliError::new("REDIS_COMMAND_BLOCKED", message))?;
+    if argv[0].eq_ignore_ascii_case("SELECT") {
+        return Err(CliError::new(
+            "REDIS_DATABASE_SELECTION_REQUIRED",
+            "Use --db to select a Redis logical database instead of SELECT.",
+        ));
+    }
+    let safety = classify_command(&argv[0]);
+    if safety != RedisCommandSafety::Allowed {
+        if connection.read_only {
+            return Err(CliError::new("CONNECTION_READ_ONLY", "This connection has read-only protection enabled."));
+        }
+        if is_production_database(&connection, &database.to_string()) {
+            return Err(CliError::new(
+                "PRODUCTION_WRITE_BLOCKED",
+                "Writes and dangerous Redis commands are blocked for production databases.",
+            ));
+        }
+        if !flags.allow_writes {
+            return Err(CliError::new(
+                "REDIS_COMMAND_BLOCKED",
+                "Redis write command is blocked. Pass --allow-writes to allow it.",
+            ));
+        }
+        if safety == RedisCommandSafety::Blocked && !flags.allow_dangerous_redis {
+            return Err(CliError::new("REDIS_COMMAND_BLOCKED", "High-risk Redis command is blocked. Pass --allow-dangerous-redis as well as --allow-writes to allow it."));
+        }
+    }
+    let execute = backend.execute_redis_command(
+        &connection,
+        database,
+        command,
+        safety == RedisCommandSafety::Blocked && flags.allow_dangerous_redis,
+    );
+    let result = if let Some(timeout_ms) = flags.timeout_ms {
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execute).await.map_err(|_| {
+            CliError::new(
+                "TIMEOUT",
+                "Redis command timed out; a write may already have executed. Check its result before retrying.",
+            )
+        })?
+    } else {
+        execute.await
+    }
+    .map_err(command_error)?;
+    format_redis_result(connection_name, database, &result, flags.format, flags.max_output_bytes.unwrap_or(65_536))
+}
+
+fn format_redis_result(
+    connection: &str,
+    database: u32,
+    result: &RedisCommandResult,
+    format: OutputFormat,
+    max_output_bytes: usize,
+) -> Result<String, CliError> {
+    let output = if format == OutputFormat::Json {
+        json_string(&json!({
+            "connection": connection,
+            "database": database,
+            "command": result.command,
+            "safety": result.safety,
+            "value": result.value,
+        }))?
+    } else {
+        let value = result.value.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+            serde_json::to_string_pretty(&result.value).unwrap_or_else(|_| result.value.to_string())
+        });
+        format!("{value}\n")
+    };
+    if output.len() > max_output_bytes {
+        return Err(CliError::new(
+            "RESULT_TOO_LARGE",
+            format!(
+                "Redis command executed, but its output exceeds {max_output_bytes} bytes. Check a write's result before retrying; use a narrower command or increase --max-output-bytes."
+            ),
+        ));
+    }
+    Ok(output)
 }
 
 fn truncate_query_result(result: &mut QueryResult, max_rows: Option<usize>) {
@@ -599,6 +717,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
         max_tables: None,
         max_rows: None,
         timeout_ms: None,
+        max_output_bytes: None,
         file: None,
         out: None,
         notes: None,
@@ -606,6 +725,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
         skills_dir: None,
         allow_writes: false,
         allow_dangerous: false,
+        allow_dangerous_redis: false,
         force: false,
         help: false,
         version: false,
@@ -632,6 +752,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
             "--version" | "-V" => flags.version = true,
             "--schema" => flags.schema = Some(option_value(argv, &mut index, "--schema")?),
             "--database" => flags.database = Some(option_value(argv, &mut index, "--database")?),
+            "--db" => flags.database = Some(option_value(argv, &mut index, "--db")?),
             "--tables" => {
                 flags.tables = option_value(argv, &mut index, "--tables")?
                     .split(',')
@@ -648,6 +769,10 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
             "--timeout" => {
                 flags.timeout_ms = Some(duration_ms(&option_value(argv, &mut index, "--timeout")?, "--timeout")?)
             }
+            "--max-output-bytes" => {
+                flags.max_output_bytes =
+                    Some(positive_usize(&option_value(argv, &mut index, "--max-output-bytes")?, "--max-output-bytes")?)
+            }
             "--file" => flags.file = Some(PathBuf::from(option_value(argv, &mut index, "--file")?)),
             "--out" => flags.out = Some(PathBuf::from(option_value(argv, &mut index, "--out")?)),
             "--notes" => flags.notes = Some(PathBuf::from(option_value(argv, &mut index, "--notes")?)),
@@ -655,6 +780,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
             "--skills-dir" => flags.skills_dir = Some(PathBuf::from(option_value(argv, &mut index, "--skills-dir")?)),
             "--allow-writes" => flags.allow_writes = true,
             "--allow-dangerous-sql" => flags.allow_dangerous = true,
+            "--allow-dangerous-redis" => flags.allow_dangerous_redis = true,
             "--force" => flags.force = true,
             value if value.starts_with('-') => {
                 return Err(CliError::new("UNKNOWN_OPTION", format!("Unknown option: {value}")))
@@ -874,12 +1000,13 @@ fn format_query_messages(messages: &[QueryMessage]) -> String {
 fn format_capabilities(format: OutputFormat) -> Result<String, CliError> {
     match format {
         OutputFormat::Json => json_string(
-            &json!({ "directQueryTypes": DIRECT_QUERY_TYPES, "bridgeRequiredTypes": BRIDGE_REQUIRED_TYPES }),
+            &json!({ "directQueryTypes": DIRECT_QUERY_TYPES, "directCommandTypes": DIRECT_COMMAND_TYPES, "bridgeRequiredTypes": BRIDGE_REQUIRED_TYPES }),
         ),
         OutputFormat::Csv => {
             let rows: Vec<Value> = DIRECT_QUERY_TYPES
                 .iter()
                 .map(|kind| json!({ "mode": "direct", "type": kind }))
+                .chain(DIRECT_COMMAND_TYPES.iter().map(|kind| json!({ "mode": "direct-command", "type": kind })))
                 .chain(BRIDGE_REQUIRED_TYPES.iter().map(|kind| json!({ "mode": "bridge", "type": kind })))
                 .collect();
             Ok(csv_table(&["mode", "type"], &rows))
@@ -887,6 +1014,7 @@ fn format_capabilities(format: OutputFormat) -> Result<String, CliError> {
         OutputFormat::Table => {
             let rows = vec![
                 json!({ "mode": "Direct", "types": DIRECT_QUERY_TYPES.join(", ") }),
+                json!({ "mode": "Direct command", "types": DIRECT_COMMAND_TYPES.join(", ") }),
                 json!({ "mode": "Requires DBX Desktop", "types": BRIDGE_REQUIRED_TYPES.join(", ") }),
             ];
             Ok(format!("{}\n", markdown_table(&["Mode", "Types"], &rows, &["mode", "types"])))
@@ -949,6 +1077,7 @@ async fn diagnostics() -> Diagnostics {
         bridge_port_file_exists,
         bridge_url,
         direct_query_types: DIRECT_QUERY_TYPES.to_vec(),
+        direct_command_types: DIRECT_COMMAND_TYPES.to_vec(),
         bridge_required_types: BRIDGE_REQUIRED_TYPES.to_vec(),
     }
 }
@@ -964,6 +1093,7 @@ fn format_diagnostics(value: &Diagnostics, format: OutputFormat) -> Result<Strin
         json!({ "check": "Connection loading", "value": if value.load_connections_ok { format!("ok ({} loaded)", value.loaded_connection_count) } else { format!("failed ({})", value.load_connections_error.as_deref().unwrap_or("unknown error")) } }),
         json!({ "check": "Desktop bridge", "value": if value.bridge_port_file_exists { format!("available ({})", value.bridge_url.as_deref().unwrap_or(&value.bridge_port_file)) } else { "not running".to_string() } }),
         json!({ "check": "Direct query types", "value": value.direct_query_types.join(", ") }),
+        json!({ "check": "Direct command types", "value": value.direct_command_types.join(", ") }),
         json!({ "check": "Bridge-required types", "value": value.bridge_required_types.join(", ") }),
     ];
     if format == OutputFormat::Csv {
@@ -1028,7 +1158,7 @@ fn csv_cell(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dbx doctor [--json]\n  dbx capabilities [--json]\n  dbx agent setup [--skills-dir path] [--force] [--json]\n  dbx agent status [--skills-dir path] [--json]\n  dbx connections list [--json]\n  dbx schema list <connection> [--schema name] [--json]\n  dbx schema describe <connection> <table> [--schema name] [--json]\n  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--json]\n  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]\n  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]\n  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]\n  dbx open <connection> <table> [--schema name] [--database name] [--json]"
+    "Usage:\n  dbx doctor [--json]\n  dbx capabilities [--json]\n  dbx agent setup [--skills-dir path] [--force] [--json]\n  dbx agent status [--skills-dir path] [--json]\n  dbx connections list [--json]\n  dbx schema list <connection> [--schema name] [--json]\n  dbx schema describe <connection> <table> [--schema name] [--json]\n  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--json]\n  dbx redis <connection> <command> [--db n] [--timeout 10s] [--max-output-bytes n] [--allow-writes] [--allow-dangerous-redis] [--json]\n  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]\n  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]\n  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]\n  dbx open <connection> <table> [--schema name] [--database name] [--json]"
 }
 
 #[cfg(test)]
@@ -1060,6 +1190,7 @@ mod tests {
         storage::{McpGlobalPolicy, Storage},
     };
     use dbx_mcp::{backend::new_connection_config, mongo::MongoCommand};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MongoBackend {
         connection: ConnectionConfig,
@@ -1082,6 +1213,90 @@ mod tests {
                 )
                 .unwrap(),
             }
+        }
+    }
+
+    struct RedisBackend {
+        connection: ConnectionConfig,
+        calls: AtomicUsize,
+        expected_skip_safety_check: bool,
+    }
+
+    impl RedisBackend {
+        fn new() -> Self {
+            Self {
+                connection: new_connection_config(
+                    "redis-test".to_string(),
+                    "local-redis".to_string(),
+                    DatabaseType::Redis,
+                    "127.0.0.1".to_string(),
+                    6379,
+                    String::new(),
+                    String::new(),
+                    Some("2".to_string()),
+                    false,
+                    None,
+                )
+                .unwrap(),
+                calls: AtomicUsize::new(0),
+                expected_skip_safety_check: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DbxBackend for RedisBackend {
+        async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String> {
+            Ok(McpGlobalPolicy::default())
+        }
+
+        async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
+            Ok(vec![self.connection.clone()])
+        }
+
+        async fn execute_agent_tool(
+            &self,
+            _connection: &ConnectionConfig,
+            _database: &str,
+            _tool_name: &str,
+            _arguments: Value,
+            _permissions: AgentSqlPermissions,
+        ) -> ToolResult {
+            panic!("Redis CLI commands must not fall through to agent SQL execution")
+        }
+
+        async fn execute_redis_command(
+            &self,
+            _connection: &ConnectionConfig,
+            database: u32,
+            command: &str,
+            skip_safety_check: bool,
+        ) -> Result<RedisCommandResult, String> {
+            assert_eq!(database, 3);
+            assert_eq!(skip_safety_check, self.expected_skip_safety_check);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RedisCommandResult {
+                command: command.to_string(),
+                safety: classify_command(&parse_command_argv(command).unwrap()[0]),
+                value: json!("ok"),
+            })
+        }
+
+        async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
+            Ok(config)
+        }
+
+        async fn duplicate_connection_for_mcp(
+            &self,
+            _source_id: &str,
+            _copy_id: &str,
+            _copy_name: &str,
+        ) -> Result<ConnectionConfig, String> {
+            Err("not exercised".to_string())
+        }
+
+        async fn remove_connection_for_mcp(&self, _connection_id: &str) -> Result<bool, String> {
+            Ok(true)
         }
     }
 
@@ -1162,6 +1377,81 @@ mod tests {
         assert_eq!(flags.max_rows, Some(50));
         assert_eq!(flags.timeout_ms, Some(10_000));
         assert!(flags.format == OutputFormat::Json);
+    }
+
+    #[tokio::test]
+    async fn redis_read_and_opted_in_write_use_selected_database() {
+        let backend = RedisBackend::new();
+        let read = parse_flags(&args(&["redis", "local-redis", "GET key", "--db", "3", "--json"])).unwrap();
+        let output: Value = serde_json::from_str(&run_with_backend(&backend, read).await.unwrap()).unwrap();
+        assert_eq!(output["database"], 3);
+        assert_eq!(output["value"], "ok");
+        assert_eq!(output["safety"], "allowed");
+
+        let write =
+            parse_flags(&args(&["redis", "local-redis", "SET key value", "--db", "3", "--allow-writes", "--json"]))
+                .unwrap();
+        let output: Value = serde_json::from_str(&run_with_backend(&backend, write).await.unwrap()).unwrap();
+        assert_eq!(output["safety"], "write");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn redis_write_requires_opt_in_and_respects_connection_protection() {
+        let mut backend = RedisBackend::new();
+        let write = parse_flags(&args(&["redis", "local-redis", "SET key value"])).unwrap();
+        assert_eq!(run_with_backend(&backend, write).await.unwrap_err().code, "REDIS_COMMAND_BLOCKED");
+        backend.connection.read_only = true;
+        let write = parse_flags(&args(&["redis", "local-redis", "SET key value", "--allow-writes"])).unwrap();
+        assert_eq!(run_with_backend(&backend, write).await.unwrap_err().code, "CONNECTION_READ_ONLY");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redis_production_and_database_switch_are_blocked() {
+        let mut backend = RedisBackend::new();
+        backend.connection.is_production = true;
+        let write = parse_flags(&args(&["redis", "local-redis", "SET key value", "--allow-writes"])).unwrap();
+        assert_eq!(run_with_backend(&backend, write).await.unwrap_err().code, "PRODUCTION_WRITE_BLOCKED");
+        let select = parse_flags(&args(&["redis", "local-redis", "SELECT 4"])).unwrap();
+        assert_eq!(run_with_backend(&backend, select).await.unwrap_err().code, "REDIS_DATABASE_SELECTION_REQUIRED");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redis_high_risk_requires_both_flags() {
+        let mut backend = RedisBackend::new();
+        let high_risk = parse_flags(&args(&["redis", "local-redis", "FLUSHDB", "--allow-writes"])).unwrap();
+        assert_eq!(run_with_backend(&backend, high_risk).await.unwrap_err().code, "REDIS_COMMAND_BLOCKED");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        backend.expected_skip_safety_check = true;
+        let high_risk = parse_flags(&args(&[
+            "redis",
+            "local-redis",
+            "FLUSHDB",
+            "--db",
+            "3",
+            "--allow-writes",
+            "--allow-dangerous-redis",
+            "--json",
+        ]))
+        .unwrap();
+        let output: Value = serde_json::from_str(&run_with_backend(&backend, high_risk).await.unwrap()).unwrap();
+        assert_eq!(output["safety"], "blocked");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn redis_output_is_bounded() {
+        let result = RedisCommandResult {
+            command: "GET key".to_string(),
+            safety: RedisCommandSafety::Allowed,
+            value: json!("long value"),
+        };
+        assert_eq!(
+            format_redis_result("local-redis", 0, &result, OutputFormat::Json, 16).unwrap_err().code,
+            "RESULT_TOO_LARGE"
+        );
     }
 
     #[test]

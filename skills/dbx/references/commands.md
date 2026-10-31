@@ -10,7 +10,7 @@ dbx capabilities --json
 dbx connections list --json
 ```
 
-`doctor` reports connection storage and Desktop bridge health. `capabilities` identifies direct-query and bridge-required database types. Connection listings omit secrets.
+`doctor` reports connection storage and Desktop bridge health. `capabilities` identifies direct-query, direct-command (Redis), and bridge-required database types. Connection listings omit secrets.
 
 ## Schema Inspection
 
@@ -31,6 +31,15 @@ dbx query <connection> --file ./query.sql --limit 50 --timeout 10s --json
 Set `DBX_CONNECTION` to omit the connection argument from `query` and `context` commands. If SQL begins with a dash, place `--` before the SQL argument.
 
 Writes require `--allow-writes`. Dangerous SQL such as `DROP`, `TRUNCATE`, and `ALTER` requires both `--allow-writes` and `--allow-dangerous-sql`.
+
+## Redis
+
+```bash
+dbx redis <connection> "GET key" --db 0 --timeout 10s --json
+dbx redis <connection> "SET key value" --db 0 --allow-writes --json
+```
+
+Pass the complete Redis command as one quoted argument. `--db` selects the logical database; `SELECT` is rejected. Read-only commands need no write flag. Writes and deletion commands require `--allow-writes`; high-risk or unknown commands also require `--allow-dangerous-redis`. Output is limited to 65,536 bytes by default; use `--max-output-bytes` to increase it. CSV output is unavailable.
 
 ## Prompt Context
 

@@ -78,7 +78,7 @@ dbx open local users
 | Command                                     | Description                                           |
 | ------------------------------------------- | ----------------------------------------------------- |
 | `dbx doctor`                                | Show local DBX config and desktop bridge diagnostics  |
-| `dbx capabilities`                          | Show direct-query and desktop-bridge database support |
+| `dbx capabilities`                          | Show direct-query, direct-command, and desktop-bridge support |
 | `dbx agent setup`                           | Install or update the bundled official DBX Skill      |
 | `dbx agent status`                          | Inspect the installed DBX Skill                       |
 | `dbx connections list`                      | List DBX connections without printing secrets         |
@@ -86,6 +86,7 @@ dbx open local users
 | `dbx schema describe <connection> <table>`  | Show table columns                                    |
 | `dbx query <connection> <sql>`              | Execute one SQL statement                             |
 | `dbx query <connection> --file ./query.sql` | Execute SQL from a file                               |
+| `dbx redis <connection> <command>`          | Execute one Redis command                             |
 | `dbx context <connection>`                  | Print compact schema context for prompts              |
 | `dbx open <connection> <table>`             | Open a table in DBX Desktop                           |
 
@@ -102,6 +103,17 @@ Errors are written to stderr and return a non-zero exit code.
 Use `--limit <n>` to control returned query rows and `--timeout <duration>` to control query timeout. Durations accept `ms`, `s`, or `m`, such as `500ms`, `10s`, or `1m`.
 
 Use `--allow-writes` for non-dangerous write statements. Dangerous SQL such as `DROP`, `TRUNCATE`, and `ALTER` requires both `--allow-writes` and `--allow-dangerous-sql`.
+
+## Redis Commands
+
+Use a Redis connection name and quote the entire command as one shell argument. `--db` selects a logical database; when omitted, the connection's configured database is used (or 0). `SELECT` is rejected so commands cannot silently change the selected database.
+
+```bash
+dbx redis cache "GET app:key" --db 0 --timeout 10s --json
+dbx redis cache "SET app:key value" --db 0 --allow-writes --json
+```
+
+Redis commands are read-only by default. Writes, including deletion commands such as `DEL`, require `--allow-writes`. Commands classified as high-risk or unknown require both `--allow-writes` and `--allow-dangerous-redis`. Connection read-only protection and production database write protection cannot be overridden. The command returns at most 65,536 output bytes by default; use a narrower Redis command or set `--max-output-bytes` explicitly. CSV output is not supported.
 
 For SQL that starts with a dash, pass `--` before the SQL:
 
@@ -127,11 +139,12 @@ Some CLI commands can run without DBX Desktop:
 - `schema list`
 - `schema describe`
 - `query`
+- `redis`
 - `context`
 
 Direct execution supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge or DBX Agent/JDBC infrastructure.
 
-Use `dbx doctor` to check whether the DBX connection database, connection table, native SQLite loader, and desktop bridge are available. Use `dbx capabilities` to list direct-query and bridge-required database types.
+Use `dbx doctor` to check whether the DBX connection database, connection table, native SQLite loader, and desktop bridge are available. Use `dbx capabilities` to list direct-query, direct-command (Redis), and bridge-required database types.
 
 If the optional platform package was not installed, reinstall without `--no-optional`:
 

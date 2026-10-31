@@ -18,6 +18,8 @@ Before adding `--allow-writes`:
 
 Do not interpret general statements such as "do whatever is needed" as approval for an unspecified database write.
 
+For `dbx redis`, obtain explicit approval for the exact connection, logical database, key(s), and command before using `--allow-writes`. Commands such as `DEL` also require this flag. High-risk or unknown Redis commands additionally require `--allow-dangerous-redis`; obtain explicit approval for the exact operation. Never override a connection's read-only setting or production protection.
+
 ## Dangerous SQL and DDL
 
 `DROP`, `TRUNCATE`, `ALTER`, and equivalent dangerous operations require both `--allow-writes` and `--allow-dangerous-sql`. Obtain explicit approval for the exact operation and object before using either flag.

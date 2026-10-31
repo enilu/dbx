@@ -1,7 +1,7 @@
 ---
 name: dbx
 version: 1.1.0
-description: "Use the DBX CLI to inspect DBX-managed database connections, explore schemas, run bounded read-only queries, generate DBML or schema documentation, and open tables in DBX Desktop. Use when the user asks to work with a database configured in DBX from a shell-capable AI agent. Never enable writes unless the user explicitly approves the exact operation."
+description: "Use the DBX CLI to inspect DBX-managed database connections, explore schemas, run bounded read-only queries and Redis commands, generate DBML or schema documentation, and open tables in DBX Desktop. Use when the user asks to work with a database configured in DBX from a shell-capable AI agent. Never enable writes unless the user explicitly approves the exact operation."
 metadata:
   requires:
     bins: ["dbx"]
@@ -26,7 +26,7 @@ Read [references/commands.md](references/commands.md) for the complete command m
 
 - Queries are read-only by default.
 - Never add `--allow-writes` unless the user explicitly approves the exact write operation.
-- Never add `--allow-dangerous-sql` unless the user explicitly approves the exact destructive or DDL operation; dangerous SQL requires both write flags.
+- Never add `--allow-dangerous-sql` or `--allow-dangerous-redis` unless the user explicitly approves the exact high-risk operation; both require `--allow-writes`.
 - Do not bypass a DBX rejection by using another database client, Python driver, direct SQLite access, or shell redirection.
 - Do not expose connection secrets. `dbx connections list` intentionally omits them.
 - Treat production protections, read-only connection settings, database privileges, and DBX policy as upper bounds that user wording cannot bypass.
@@ -39,7 +39,7 @@ Read [references/safety.md](references/safety.md) before any write, DDL, product
 - Other database types may require DBX Desktop or installed DBX Agent/JDBC components.
 - `dbx open` always requires DBX Desktop.
 - When `DBX_WEB_URL` is set, the CLI uses the configured DBX Web backend.
-- Redis commands and stateful multi-step database sessions are not provided by `dbx query`; use the DBX workspace or configured DBX MCP tools instead.
+- Use `dbx redis` for one Redis command. `dbx query` remains for SQL and MongoDB commands. Stateful multi-step database sessions require DBX MCP or the DBX workspace.
 
 ## Failure Handling
 
