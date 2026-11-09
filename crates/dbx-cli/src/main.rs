@@ -3,7 +3,7 @@ mod agent_skill;
 use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
 use dbx_core::{
-    db::redis_driver::{classify_command, parse_command_argv, RedisCommandResult, RedisCommandSafety},
+    db::redis_driver::{classify_command, parse_command_argv_strings, RedisCommandResult, RedisCommandSafety},
     models::connection::{ConnectionConfig, DatabaseType},
     production_safety::{is_production_database, targets_production_database},
     sql_risk::{classify_sql_risk_for_database, SqlRisk},
@@ -434,7 +434,7 @@ async fn run_redis(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, Cl
             .parse::<u32>()
             .map_err(|_| CliError::new("INVALID_DATABASE", "Redis database must be a non-negative integer."))?
     };
-    let argv = parse_command_argv(command).map_err(|message| CliError::new("REDIS_COMMAND_BLOCKED", message))?;
+    let argv = parse_command_argv_strings(command).map_err(|message| CliError::new("REDIS_COMMAND_BLOCKED", message))?;
     if argv[0].eq_ignore_ascii_case("SELECT") {
         return Err(CliError::new(
             "REDIS_DATABASE_SELECTION_REQUIRED",
@@ -1277,7 +1277,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(RedisCommandResult {
                 command: command.to_string(),
-                safety: classify_command(&parse_command_argv(command).unwrap()[0]),
+                safety: classify_command(&parse_command_argv_strings(command).unwrap()[0]),
                 value: json!("ok"),
             })
         }
@@ -1331,8 +1331,10 @@ mod tests {
             Ok(QueryResult {
                 columns: Vec::new(),
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: Vec::new(),
                 spatial_columns: vec![],
+                raw_key_cells: Vec::new(),
                 spatial_values: vec![],
                 rows: Vec::new(),
                 affected_rows: 2,
@@ -1508,8 +1510,10 @@ mod tests {
         let mut result = QueryResult {
             columns: Vec::new(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows: Vec::new(),
             affected_rows: 1,
@@ -1560,6 +1564,36 @@ mod tests {
         let output = format_query("local", &result, OutputFormat::Json).unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();
         assert!(value.get("messages").is_none());
+    }
+
+    #[test]
+    fn format_query_preserves_exact_decimal_values_in_json_table_and_csv() {
+        let value = "9007199254740993.123456789012";
+        let result = QueryResult {
+            columns: vec!["amount".to_string()],
+            column_types: vec!["NUMBER(38,12)".to_string()],
+            deferred_large_value_cells: Vec::new(),
+            column_sortables: Vec::new(),
+            spatial_columns: Vec::new(),
+            raw_key_cells: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![serde_json::from_str(value).unwrap()]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            server_execute_time_us: None,
+            query_timings_ms: None,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        };
+
+        let json_output = format_query("local", &result, OutputFormat::Json).unwrap();
+        let json_value: Value = serde_json::from_str(&json_output).unwrap();
+        assert_eq!(json_value["rows"][0]["amount"].as_number().unwrap().as_str(), value);
+        assert!(format_query("local", &result, OutputFormat::Table).unwrap().contains(value));
+        assert!(format_query("local", &result, OutputFormat::Csv).unwrap().contains(value));
     }
 
     #[tokio::test]
